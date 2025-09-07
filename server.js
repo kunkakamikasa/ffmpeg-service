@@ -1,310 +1,143 @@
-// server.js
-// FFmpeg web service with motion effects + optional subtitles (SRT)
-// Works on Render free tier. Requires ffmpeg in PATH (Render has it).
-// Make sure to set BASE_URL in Render Environment to your service URL,
-// e.g. https://ffmpeg-service-xxxxx.onrender.com
-
 import express from "express";
-import cors from "cors";
-import path from "path";
+import bodyParser from "body-parser";
 import fs from "fs";
-import { fileURLToPath } from "url";
-import { execFile } from "child_process";
-import axios from "axios";
-import crypto from "crypto";
-import os from "os";
+import { exec } from "child_process";
+import path from "path";
+import fetch from "node-fetch";
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-// --- Configs & Paths ---
-const PORT = process.env.PORT || 3000;
-const OUTPUT_DIR = process.env.OUTPUT_DIR || path.join(__dirname, "output");
-
-// IMPORTANT: set this in Render -> Environment
-const BASE_URL =
-  process.env.BASE_URL || "http://localhost:" + PORT; // fallback for local
-
-// Ensure output exists
-fs.mkdirSync(OUTPUT_DIR, { recursive: true });
-
-// Serve static files from /output so returned URLs are directly playable
 const app = express();
-app.use(cors());
-app.use(express.json({ limit: "20mb" }));
-app.use("/output", express.static(OUTPUT_DIR, { maxAge: "30d", index: false }));
+app.use(bodyParser.json({ limit: "20mb" }));
 
-// ---------- Utility helpers ----------
-const tmpDir = path.join(os.tmpdir(), "ffmpeg-svc");
-fs.mkdirSync(tmpDir, { recursive: true });
-
-function uid(n = 8) {
-  return crypto.randomBytes(n).toString("hex");
+// 输出目录
+const OUTPUT_DIR = "/opt/render/project/src/output";
+if (!fs.existsSync(OUTPUT_DIR)) {
+  fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 }
 
-function safeName(s) {
-  return String(s || "")
-    .replace(/[^\w.-]+/g, "_")
-    .slice(0, 64);
+// 基础 URL（从环境变量取）
+const BASE_URL = process.env.PUBLIC_BASE_URL || "";
+
+// 下载远程文件到 /tmp
+async function downloadToTmp(url, ext = "") {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Download failed: ${url}`);
+  const buf = Buffer.from(await res.arrayBuffer());
+  const tmp = `/tmp/${Date.now()}_${Math.random().toString(36).slice(2)}${ext}`;
+  fs.writeFileSync(tmp, buf);
+  return tmp;
 }
 
-async function downloadToFile(url, extHint = "") {
-  const id = uid();
-  const ext =
-    extHint ||
-    (new URL(url).pathname.split(".").pop() || "").toLowerCase().split("?")[0];
-  const file = path.join(tmpDir, `${id}.${safeName(ext) || "bin"}`);
+// -------------------- 路由 --------------------
 
-  const res = await axios.get(url, { responseType: "arraybuffer" });
-  fs.writeFileSync(file, Buffer.from(res.data));
-  return file;
-}
+// 健康检查
+app.get("/healthz", (_req, res) => res.status(200).send("OK"));
 
-function runFFmpeg(args, logTag = "ffmpeg") {
-  return new Promise((resolve, reject) => {
-    const p = execFile("ffmpeg", args, { windowsHide: true });
-    let stderr = "";
-    p.stderr.on("data", (d) => {
-      stderr += d.toString();
-      // Optionally log concise progress:
-      // process.stderr.write(".");
-    });
-    p.on("close", (code) => {
-      if (code === 0) resolve({ code, stderr });
-      else reject(new Error(`[${logTag}] exit ${code}\n${stderr}`));
-    });
-  });
-}
+// 根路径
+app.get("/", (_req, res) => res.status(200).send("FFmpeg service is running"));
 
-// Build default subtle horror motion filter for 1080x1920
-function buildMotionFilter(opts = {}) {
-  const {
-    width = 1080,
-    height = 1920,
-    scaleFactor = 1.22, // 1.1~1.3
-    panXSlow = 20, // px amplitude
-    panXFast = 5,
-    panYSlow = 16,
-    panYFast = 4,
-    rotSlow = 0.005, // radians amplitude
-    rotFast = 0.002,
-    contrast = 1.06,
-    brightness = -0.04,
-    saturation = 0.92,
-    noiseStrength = 9, // 0~10
-    rgbShift = 2, // 0~6
-    vignette = 0.12, // 0~0.6
-    vignetteSoft = 0.65,
-    fps = 30,
-    // switches
-    enableNoise = true,
-    enableRgbShift = true,
-    enableVignette = true,
-  } = opts;
-
-  const scaleW = `ceil(${width}*${scaleFactor})`;
-  const scaleH = `ceil(${height}*${scaleFactor})`;
-
-  const pieces = [
-    `scale=${scaleW}:${scaleH}`,
-    `crop=${width}:${height}:x='(in_w-out_w)/2 + ${panXSlow}*sin(t*0.25) + ${panXFast}*sin(t*4.2)':y='(in_h-out_h)/2 + ${panYSlow}*sin(t*0.20) + ${panYFast}*sin(t*3.5)'`,
-    `rotate='${rotSlow}*sin(1.7*t)+${rotFast}*cos(9*t)'`,
-    `eq=contrast=${contrast}:brightness=${brightness}:saturation=${saturation}`,
-  ];
-
-  if (enableNoise) pieces.push(`noise=alls=${noiseStrength}:allf=t`);
-  if (enableRgbShift)
-    pieces.push(`rgbashift=rh=${rgbShift}:rv=${rgbShift}:gh=-${rgbShift}:gv=-${rgbShift}`);
-  if (enableVignette) pieces.push(`vignette=${vignette}:${vignetteSoft}`);
-
-  pieces.push(`fps=${fps}`, `format=yuv420p`);
-
-  // Output label [v] for mapping
-  return `${pieces.join(",")}[v]`;
-}
-
-// Optional: subtitles force_style
-function buildAssStyle(style = {}) {
-  // libass style keys
-  const {
-    Fontname = "Arial",
-    Fontsize = 36,
-    PrimaryColour = "&H00FFFFFF&", // white
-    OutlineColour = "&H00000000&", // black
-    BackColour = "&H64000000&", // shadow
-    BorderStyle = 1, // 1 = outline + shadow
-    Outline = 2,
-    Shadow = 1,
-    Alignment = 2, // 2 bottom-center
-    MarginV = 48,
-    Bold = 0,
-    Italic = 0,
-  } = style;
-
-  return [
-    `Fontname=${Fontname}`,
-    `Fontsize=${Fontsize}`,
-    `PrimaryColour=${PrimaryColour}`,
-    `OutlineColour=${OutlineColour}`,
-    `BackColour=${BackColour}`,
-    `BorderStyle=${BorderStyle}`,
-    `Outline=${Outline}`,
-    `Shadow=${Shadow}`,
-    `Alignment=${Alignment}`,
-    `MarginV=${MarginV}`,
-    `Bold=${Bold}`,
-    `Italic=${Italic}`,
-  ].join(",");
-}
-
-// -------- Main route (compatible with your current workflow) --------
-// POST /make/segments
-// Body:
-// {
-//   "image_url": "<url>",
-//   "audio_urls": ["<url1>", "<url2>", ...] | "<single>",
-//   "outfile_prefix": "demo_dropbox",
-//   "style": { ... optional motion params ... },
-//   "subtitles": {
-//      "srt_url": "<url>" | null,
-//      "srt_text": "1\n00:00:00,000 --> 00:00:01,000\n...", // 二选一
-//      "ass_style": { Fontsize, MarginV, Alignment, ... } // 可选
-//   }
-// }
+// 制作视频
 app.post("/make/segments", async (req, res) => {
   try {
-    const startedAt = Date.now();
-    const {
-      image_url,
-      audio_urls,
-      outfile_prefix = "seg",
-      style = {},
-      subtitles = null,
-    } = req.body || {};
+    const { image_url, audio_urls, outfile_prefix, style, subtitles } = req.body;
+    if (!image_url || !audio_urls || audio_urls.length === 0) {
+      return res.status(400).json({ error: "image_url and audio_urls required" });
+    }
 
-    if (!image_url || !audio_urls || (Array.isArray(audio_urls) && audio_urls.length === 0)) {
-      return res.status(400).json({
-        error: "image_url 和 audio_urls 必填，且 audio_urls 至少 1 个",
+    // 下载图像
+    const imgFile = await downloadToTmp(image_url, path.extname(image_url) || ".png");
+
+    // 合并多个音频
+    let audioFile;
+    if (audio_urls.length === 1) {
+      audioFile = await downloadToTmp(audio_urls[0], ".mp3");
+    } else {
+      const parts = [];
+      for (const u of audio_urls) {
+        parts.push(await downloadToTmp(u, ".mp3"));
+      }
+      const listFile = `/tmp/list_${Date.now()}.txt`;
+      fs.writeFileSync(listFile, parts.map(p => `file '${p}'`).join("\n"));
+      audioFile = `/tmp/concat_${Date.now()}.mp3`;
+      await new Promise((resolve, reject) => {
+        exec(`ffmpeg -y -f concat -safe 0 -i ${listFile} -c copy ${audioFile}`, (err) => {
+          if (err) reject(err); else resolve();
+        });
       });
     }
 
-    // -------- 1) Download inputs --------
-    const imgFile = await downloadToFile(image_url, "png");
+    // 基本参数
+    const scaleFactor = style?.scaleFactor || 1.0;
+    const panXSlow = style?.panXSlow || 0;
+    const panXFast = style?.panXFast || 0;
+    const panYSlow = style?.panYSlow || 0;
+    const panYFast = style?.panYFast || 0;
+    const rotSlow = style?.rotSlow || 0;
+    const rotFast = style?.rotFast || 0;
+    const contrast = style?.contrast ?? 1.0;
+    const brightness = style?.brightness ?? 0.0;
+    const saturation = style?.saturation ?? 1.0;
+    const noiseStrength = style?.noiseStrength || 0;
+    const rgbShift = style?.rgbShift || 0;
+    const vignette = style?.vignette || 0;
+    const vignetteSoft = style?.vignetteSoft || 0.5;
+    const fps = style?.fps || 30;
+    const crf = style?.crf || 20;
+    const audio_bitrate = style?.audio_bitrate || "192k";
 
-    const audioList = Array.isArray(audio_urls) ? audio_urls : [audio_urls];
-    const localAudios = [];
-    for (let i = 0; i < audioList.length; i++) {
-      localAudios.push(await downloadToFile(audioList[i], "mp3"));
-    }
+    // 构建 filter_complex
+    let filters = `[0:v]scale=ceil(1080*${scaleFactor}):ceil(1920*${scaleFactor}),`;
+    filters += `crop=1080:1920:x='(in_w-out_w)/2 + ${panXSlow}*sin(t*0.25) + ${panXFast}*sin(t*4.2)':`;
+    filters += `y='(in_h-out_h)/2 + ${panYSlow}*sin(t*0.20) + ${panYFast}*sin(t*3.5)',`;
+    filters += `rotate='${rotSlow}*sin(2*t)+${rotFast}*cos(7*t)',`;
+    filters += `eq=contrast=${contrast}:brightness=${brightness}:saturation=${saturation}`;
+    if (noiseStrength > 0) filters += `,noise=alls=${noiseStrength}:allf=t`;
+    if (rgbShift > 0) filters += `,rgbashift=rh=${rgbShift}:rv=${rgbShift}:gh=-${rgbShift}:gv=-${rgbShift}`;
+    if (vignette > 0) filters += `,vignette=${vignette}:${vignetteSoft}`;
+    filters += `,fps=${fps},format=yuv420p[v]`;
 
-    // If multiple audio segments, concat to one
-    let audioFile = localAudios[0];
-    if (localAudios.length > 1) {
-      const listFile = path.join(tmpDir, `concat_${uid()}.txt`);
-      fs.writeFileSync(
-        listFile,
-        localAudios.map((f) => `file '${f.replace(/'/g, "'\\''")}'`).join("\n")
-      );
-      const concatOut = path.join(tmpDir, `aud_${uid()}.mp3`);
-      await runFFmpeg(
-        ["-f", "concat", "-safe", "0", "-i", listFile, "-c", "copy", concatOut],
-        "concat"
-      );
-      audioFile = concatOut;
-    }
+    // 输出文件名
+    const outName = `${outfile_prefix || "out"}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.mp4`;
+    const outPath = path.join(OUTPUT_DIR, outName);
 
-    // -------- 2) Optional: subtitles (download or inline) --------
-    let srtFile = null;
-    let subtitlesFilter = ""; // appended inside -filter_complex when present
-    if (subtitles && (subtitles.srt_url || subtitles.srt_text)) {
+    // 临时字幕文件
+    let subsCmd = "";
+    if (subtitles?.srt_url || subtitles?.srt_text) {
+      const srtFile = `/tmp/subs_${Date.now()}.srt`;
       if (subtitles.srt_url) {
-        srtFile = await downloadToFile(subtitles.srt_url, "srt");
+        const subsRes = await fetch(subtitles.srt_url);
+        if (!subsRes.ok) throw new Error("Subtitle download failed");
+        fs.writeFileSync(srtFile, Buffer.from(await subsRes.arrayBuffer()));
       } else if (subtitles.srt_text) {
-        srtFile = path.join(tmpDir, `sub_${uid()}.srt`);
         fs.writeFileSync(srtFile, subtitles.srt_text);
       }
-
-      const forceStyle = buildAssStyle(subtitles.ass_style || {});
-      // subtitles= reads file internally; chain it after we produce [v0]
-      // We'll produce v0 then subtitles -> [v]
-      // buildMotionFilter will output [v0] instead of [v] if subtitles are used
-      subtitlesFilter = `,subtitles='${srtFile.replace(/'/g, "'\\''")}':force_style='${forceStyle.replace(
-        /'/g,
-        "\\'"
-      )}'`;
+      const styleOpts = subtitles.ass_style
+        ? Object.entries(subtitles.ass_style).map(([k, v]) => `${k}=${v}`).join(",")
+        : "";
+      subsCmd = `-vf "subtitles=${srtFile}${styleOpts ? `:force_style='${styleOpts}'` : ""}"`;
     }
 
-    // -------- 3) Build filters & run ffmpeg --------
-    const id = `${outfile_prefix}_${startedAt}_${uid(6)}`;
-    const outFile = path.join(OUTPUT_DIR, `${safeName(id)}.mp4`);
+    // 拼 ffmpeg 命令
+    const cmd = `ffmpeg -y -i ${imgFile} -i ${audioFile} -filter_complex "${filters}" -map "[v]" -map 1:a -c:v libx264 -preset veryfast -crf ${crf} -c:a aac -b:a ${audio_bitrate} -shortest ${subsCmd} ${outPath}`;
 
-    // If we have subtitles, we first label to [v0], then add subtitles -> [v]
-    const motion = buildMotionFilter(style);
-    const filter = subtitles
-      ? motion.replace(/\[v\]$/, "[v0]") + `${subtitlesFilter}[v]`
-      : motion;
-
-    const args = [
-      "-y",
-      "-loop",
-      "1",
-      "-i",
-      imgFile,
-      "-i",
-      audioFile,
-      "-filter_complex",
-      filter,
-      "-map",
-      "[v]",
-      "-map",
-      "1:a",
-      "-c:v",
-      "libx264",
-      "-preset",
-      "veryfast",
-      "-crf",
-      String(style.crf || 20),
-      "-c:a",
-      "aac",
-      "-b:a",
-      String(style.audio_bitrate || "192k"),
-      "-shortest",
-      outFile,
-    ];
-
-    await runFFmpeg(args, "render");
-
-    const fullUrl = `${BASE_URL.replace(/\/+$/, "")}/output/${path.basename(outFile)}`;
-
-    // -------- 4) Respond --------
-    return res.json({
-      ok: true,
-      file: `/output/${path.basename(outFile)}`, // 相对路径（兼容旧用法）
-      full_url: fullUrl, // 新增：完整 URL（Make 里可直接用）
-      duration_hint: "matches audio duration",
-      width: 1080,
-      height: 1920,
-      style_used: style || {},
-      subtitles: !!subtitles,
-      id,
+    await new Promise((resolve, reject) => {
+      exec(cmd, (err, stdout, stderr) => {
+        if (err) reject(stderr || err); else resolve(stdout);
+      });
     });
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({
-      error: "FFmpeg process failed",
-      detail: (err && err.message) || String(err),
-    });
+
+    const fullUrl = BASE_URL ? `${BASE_URL}/output/${outName}` : `/output/${outName}`;
+    res.json({ ok: true, file: `/output/${outName}`, full_url: fullUrl });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: String(e) });
   }
 });
 
-// Health
-app.get("/", (_req, res) => {
-  res.type("text").send("FFmpeg service is up. Try POST /make/segments");
-});
+// 静态文件（视频输出目录）
+app.use("/output", express.static(OUTPUT_DIR));
 
-// Start
+// 启动
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log(`✅ FFmpeg service listening on :${PORT}`);
-  console.log(`   OUTPUT_DIR: ${OUTPUT_DIR}`);
-  console.log(`   BASE_URL:   ${BASE_URL}`);
+  console.log(`FFmpeg service on ${PORT}`);
 });
