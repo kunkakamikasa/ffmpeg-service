@@ -14,7 +14,7 @@ if (!fs.existsSync(OUTPUT_DIR)) {
   fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 }
 
-// 基础 URL（从环境变量取）
+// 基础 URL（Render 环境变量里配置 PUBLIC_BASE_URL）
 const BASE_URL = process.env.PUBLIC_BASE_URL || "";
 
 // 下载远程文件到 /tmp
@@ -65,37 +65,21 @@ app.post("/make/segments", async (req, res) => {
       });
     }
 
-    // 基本参数
+    // 样式参数
     const scaleFactor = style?.scaleFactor || 1.0;
-    const panXSlow = style?.panXSlow || 0;
-    const panXFast = style?.panXFast || 0;
-    const panYSlow = style?.panYSlow || 0;
-    const panYFast = style?.panYFast || 0;
-    const rotSlow = style?.rotSlow || 0;
-    const rotFast = style?.rotFast || 0;
     const contrast = style?.contrast ?? 1.0;
     const brightness = style?.brightness ?? 0.0;
     const saturation = style?.saturation ?? 1.0;
-    const noiseStrength = style?.noiseStrength || 0;
-    const rgbShift = style?.rgbShift || 0;
-    const vignette = style?.vignette || 0;
-    const vignetteSoft = style?.vignetteSoft || 0.5;
     const fps = style?.fps || 30;
     const crf = style?.crf || 20;
     const audio_bitrate = style?.audio_bitrate || "192k";
 
-    // 构建 filter_complex
     let filters = `[0:v]scale=ceil(1080*${scaleFactor}):ceil(1920*${scaleFactor}),`;
-    filters += `crop=1080:1920:x='(in_w-out_w)/2 + ${panXSlow}*sin(t*0.25) + ${panXFast}*sin(t*4.2)':`;
-    filters += `y='(in_h-out_h)/2 + ${panYSlow}*sin(t*0.20) + ${panYFast}*sin(t*3.5)',`;
-    filters += `rotate='${rotSlow}*sin(2*t)+${rotFast}*cos(7*t)',`;
-    filters += `eq=contrast=${contrast}:brightness=${brightness}:saturation=${saturation}`;
-    if (noiseStrength > 0) filters += `,noise=alls=${noiseStrength}:allf=t`;
-    if (rgbShift > 0) filters += `,rgbashift=rh=${rgbShift}:rv=${rgbShift}:gh=-${rgbShift}:gv=-${rgbShift}`;
-    if (vignette > 0) filters += `,vignette=${vignette}:${vignetteSoft}`;
-    filters += `,fps=${fps},format=yuv420p[v]`;
+    filters += `crop=1080:1920:x='(in_w-out_w)/2':y='(in_h-out_h)/2',`;
+    filters += `eq=contrast=${contrast}:brightness=${brightness}:saturation=${saturation},`;
+    filters += `fps=${fps},format=yuv420p[v]`;
 
-    // 输出文件名
+    // 输出文件
     const outName = `${outfile_prefix || "out"}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.mp4`;
     const outPath = path.join(OUTPUT_DIR, outName);
 
@@ -110,13 +94,10 @@ app.post("/make/segments", async (req, res) => {
       } else if (subtitles.srt_text) {
         fs.writeFileSync(srtFile, subtitles.srt_text);
       }
-      const styleOpts = subtitles.ass_style
-        ? Object.entries(subtitles.ass_style).map(([k, v]) => `${k}=${v}`).join(",")
-        : "";
-      subsCmd = `-vf "subtitles=${srtFile}${styleOpts ? `:force_style='${styleOpts}'` : ""}"`;
+      subsCmd = `-vf "subtitles=${srtFile}"`;
     }
 
-    // 拼 ffmpeg 命令
+    // ffmpeg 命令
     const cmd = `ffmpeg -y -i ${imgFile} -i ${audioFile} -filter_complex "${filters}" -map "[v]" -map 1:a -c:v libx264 -preset veryfast -crf ${crf} -c:a aac -b:a ${audio_bitrate} -shortest ${subsCmd} ${outPath}`;
 
     await new Promise((resolve, reject) => {
@@ -133,11 +114,11 @@ app.post("/make/segments", async (req, res) => {
   }
 });
 
-// 静态文件（视频输出目录）
+// 静态文件输出
 app.use("/output", express.static(OUTPUT_DIR));
 
-// 启动
+// 启动服务
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log(`FFmpeg service on ${PORT}`);
+  console.log(`FFmpeg service running on port ${PORT}`);
 });
