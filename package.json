@@ -1,12 +1,14 @@
 {
   "name": "ffmpeg-service",
   "version": "1.0.0",
-  "main": "server.js",
-  "type": "module",
+  "main": "server.cjs",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.cjs"
   },
   "dependencies": {
-    "express": "^4.18.2"
+    "express": "^4.19.2"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
