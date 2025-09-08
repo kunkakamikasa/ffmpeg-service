@@ -1,133 +1,132 @@
-import express from "express";
-import { exec } from "child_process";
-import { promisify } from "util";
-import fs from "fs";
-import path from "path";
+// server.js
+const express = require("express");
+const cors = require("cors");
+const { spawn, execFile } = require("child_process");
+const path = require("path");
+const fs = require("fs");
 
 const app = express();
-const execAsync = promisify(exec);
+app.use(cors());
+app.use(express.json({ limit: "10mb" }));
 
-app.use(express.json());
+// 把 /tmp 作为静态目录暴露出来，便于直接访问产物
+app.use("/output", express.static("/tmp"));
 
-/**
- * 健康检查
- */
-app.get(["/", "/health", "/healthz"], (req, res) => {
-  res.type("text").send("ok");
-});
+app.get("/", (_, res) => res.type("text/plain").send("ok"));
+app.get("/healthz", (_, res) => res.type("text/plain").send("ok"));
 
 /**
- * 构造滤镜字符串
+ * 构建最小可跑的 FFmpeg 命令（竖屏 1080x1920，轻微运动+暗角等）
+ * 你之前的“恐怖风格参数化”版本还能继续叠加，这里保留基础款，确保服务可跑。
  */
-function buildFilter(opts = {}) {
-  const {
-    resolution = "1280x720",
-    fps = 30,
-    contrast,
-    brightness,
-    saturation,
-    vignette,
-    noise,
-    rgbashift,
-    rotate,
-  } = opts;
+function buildFfmpegArgs({ imageUrl, audioUrl, outFile }) {
+  const filter =
+    "[0:v]" +
+    "scale=ceil(1080*1.18):ceil(1920*1.18)," +
+    "crop=1080:1920:" +
+    "x='(in_w-out_w)/2 + 22*sin(t*0.22) + 4*sin(t*3.5)'" +
+    ":y='(in_h-out_h)/2 + 16*sin(t*0.19) + 3*sin(t*2.8)'," +
+    "rotate='0.004*sin(2*t)+0.002*cos(7*t)'," +
+    "eq=contrast=1.06:brightness=-0.04:saturation=0.92," +
+    "noise=alls=9:allf=t," +
+    "rgbashift=rh=2:rv=2:gh=-2:gv=-2," +
+    "vignette=0.12:0.65," +
+    "fps=30,format=yuv420p[v]";
 
-  let filters = [];
-
-  // 基础
-  filters.push(`scale=${resolution.split("x")[0]}:${resolution.split("x")[1]}`);
-  filters.push(`fps=${fps}`);
-  filters.push("format=yuv420p");
-
-  // 样式参数
-  if (contrast || brightness || saturation) {
-    filters.push(
-      `eq=${contrast ? `contrast=${contrast}:` : ""}${
-        brightness ? `brightness=${brightness}:` : ""
-      }${saturation ? `saturation=${saturation}` : ""}`
-        .replace(/:+$/, "") // 去掉多余的冒号
-    );
-  }
-
-  if (vignette) filters.push(`vignette=${vignette}`);
-  if (noise) filters.push(`noise=alls=${noise}:allf=t`);
-  if (rgbashift)
-    filters.push(
-      `rgbashift=rh=${rgbashift.rh || 0}:rv=${rgbashift.rv || 0}:gh=${
-        rgbashift.gh || 0
-      }:gv=${rgbashift.gv || 0}`
-    );
-  if (rotate) filters.push(`rotate='${rotate}'`);
-
-  return `[0:v]${filters.join(",")}[v]`;
+  return [
+    "-y",
+    "-loop", "1",
+    "-i", imageUrl,
+    "-i", audioUrl,
+    "-filter_complex", filter,
+    "-map", "[v]",
+    "-map", "1:a",
+    "-c:v", "libx264",
+    "-preset", "veryfast",
+    "-crf", "18",
+    "-c:a", "aac",
+    "-b:a", "192k",
+    "-shortest",
+    outFile
+  ];
 }
 
 /**
- * 生成视频 /make/segments
+ * 同步跑：等 FFmpeg 完成再一次性返回
  */
+function runFfmpegBuffered(args) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn("ffmpeg", args, { stdio: ["ignore", "pipe", "pipe"] });
+    let stderr = "";
+    proc.stderr.on("data", (d) => { stderr += d.toString(); });
+    proc.stdout.on("data", () => {}); // 忽略
+    proc.on("close", (code) => {
+      if (code === 0) resolve({ code, stderr });
+      else reject(new Error(`ffmpeg exit ${code}\n${stderr}`));
+    });
+  });
+}
+
+/**
+ * 流式跑：把 FFmpeg stderr 实时写回响应（curl 能立刻看到）
+ */
+function runFfmpegStream(args, res, finalUrl) {
+  res.status(200);
+  res.setHeader("Content-Type", "text/plain; charset=utf-8");
+  res.setHeader("Transfer-Encoding", "chunked");
+  res.write(`# FFmpeg started\n\n$ ffmpeg ${args.map(a => a.includes(" ") ? `"${a}"` : a).join(" ")}\n\n`);
+
+  const proc = spawn("ffmpeg", args, { stdio: ["ignore", "pipe", "pipe"] });
+
+  proc.stdout.on("data", (d) => {
+    // ffmpeg基本不往stdout写，这里留着以防万一
+    res.write(d.toString());
+  });
+  proc.stderr.on("data", (d) => {
+    res.write(d.toString());
+  });
+  proc.on("close", (code) => {
+    if (code === 0) {
+      res.write(`\n\n[DONE] code=${code}\nURL: ${finalUrl}\n`);
+      res.end();
+    } else {
+      res.write(`\n\n[ERROR] ffmpeg exit ${code}\n`);
+      res.end();
+    }
+  });
+}
+
 app.post("/make/segments", async (req, res) => {
   try {
-    const {
-      image_url,
-      audio_urls,
-      outfile_prefix = "output",
-      resolution = "1280x720",
-      fps = 30,
-      style = {},
-      subtitle_url,
-    } = req.body;
+    const body = req.body || {};
+    const imageUrl = body.image_url;
+    const audioUrls = Array.isArray(body.audio_urls) ? body.audio_urls : [];
+    const audioUrl = audioUrls[0];
+    const prefix = body.outfile_prefix || "out";
+    const ts = Date.now();
+    const outFile = path.join("/tmp", `${prefix}_${ts}.mp4`);
+    const finalUrl = `${req.protocol}://${req.get("host")}/output/${path.basename(outFile)}`;
 
-    if (!image_url || !audio_urls || audio_urls.length === 0) {
-      return res.status(400).json({
-        error: "image_url 和 audio_urls 必填，且 audio_urls 至少 1 个",
-      });
+    if (!imageUrl || !audioUrl) {
+      return res.status(400).json({ error: "image_url 和 audio_urls[0] 必填" });
     }
 
-    const safeName = `${outfile_prefix}_${Date.now()}`;
-    const outFile = `/tmp/${safeName}.mp4`;
+    const args = buildFfmpegArgs({ imageUrl, audioUrl, outFile });
 
-    // 构造输入
-    let inputs = [`-loop 1 -i "${image_url}"`];
-    audio_urls.forEach((url) => inputs.push(`-i "${url}"`));
-
-    // 构造滤镜
-    const filterComplex = buildFilter({ resolution, fps, ...style });
-
-    // 基础命令
-    let cmd = `ffmpeg -y ${inputs.join(" ")} -filter_complex "${filterComplex}" -map "[v]" -map 1:a -c:v libx264 -preset veryfast -crf 18 -c:a aac -shortest ${outFile}`;
-
-    // 如果有字幕
-    if (subtitle_url) {
-      cmd = `ffmpeg -y ${inputs.join(
-        " "
-      )} -filter_complex "${filterComplex}" -map "[v]" -map 1:a -vf "subtitles='${subtitle_url}'" -c:v libx264 -preset veryfast -crf 18 -c:a aac -shortest ${outFile}`;
+    // ?stream=1 开启流式日志
+    if (String(req.query.stream || "") === "1") {
+      return runFfmpegStream(args, res, finalUrl);
     }
 
-    console.log("Running:", cmd);
-    await execAsync(cmd);
-
-    // 输出目录
-    const outDir = "/tmp/output";
-    if (!fs.existsSync(outDir)) fs.mkdirSync(outDir);
-    fs.renameSync(outFile, path.join(outDir, `${safeName}.mp4`));
-
-    // 返回完整 URL
-    const publicBase = process.env.PUBLIC_BASE_URL || "";
-    const fileUrl = `${publicBase}/output/${safeName}.mp4`;
-
-    return res.json({ file_url: fileUrl });
+    // 默认：缓冲执行，完成后返回 JSON
+    await runFfmpegBuffered(args);
+    return res.json({ outfile: finalUrl });
   } catch (err) {
     console.error(err);
-    return res.status(500).json({ error: err.message });
+    res.status(500).json({ error: String(err.message || err) });
   }
 });
 
-/**
- * 静态托管
- */
-app.use("/output", express.static("/tmp/output"));
-
-// 启动
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`[ready] listening on ${PORT}`);
