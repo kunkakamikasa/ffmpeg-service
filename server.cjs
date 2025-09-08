@@ -1,204 +1,167 @@
-// server.js
-// --------------- 基础依赖 ---------------
+// server.cjs  —— CommonJS 版本（require 可用）
+// 作用：提供 /make/segments 生成视频；/output 静态托管；/healthz 与调试列表
+
 const express = require('express');
-const cors = require('cors');
+const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
-const { execFile } = require('child_process');
-const os = require('os');
 
-// --------------- App 初始化 ---------------
 const app = express();
-app.use(cors());
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '5mb' }));
 
-// --------------- 输出目录 & 静态托管 ---------------
-const OUTPUT_DIR = path.join(process.cwd(), 'output');
-fs.mkdirSync(OUTPUT_DIR, { recursive: true });
-
-// /output/xxx.mp4 可直接 GET
+// 让 /output 指向 /tmp，用于直接访问 ffmpeg 输出文件
+const OUTPUT_DIR = '/tmp';
 app.use('/output', express.static(OUTPUT_DIR, { fallthrough: false }));
 
-// --------------- 小工具函数 ---------------
-function publicBaseUrl(req) {
-  // 优先使用环境变量（Render Dashboard → Environment → PUBLIC_BASE_URL）
-  // 例如：https://ffmpeg-service-kunkaka.onrender.com
-  if (process.env.PUBLIC_BASE_URL) return process.env.PUBLIC_BASE_URL.replace(/\/+$/, '');
-  const proto = (req.headers['x-forwarded-proto'] || req.protocol || 'https');
-  const host = req.get('host');
-  return `${proto}://${host}`;
-}
+// 健康检查
+app.get('/healthz', (req, res) => res.json({ ok: true }));
 
-function sh(cmd, args = []) {
-  return new Promise((resolve, reject) => {
-    const child = execFile(cmd, args, { maxBuffer: 1024 * 1024 * 20 }, (err, stdout, stderr) => {
-      if (err) {
-        err.stderr = stderr;
-        err.stdout = stdout;
-        return reject(err);
-      }
-      resolve({ stdout, stderr });
-    });
-  });
-}
-
-// 构建 ffmpeg 音频输入列表与 concat 过滤器（顺序拼接多段音频）
-function buildAudioConcatInputs(audioUrls = []) {
-  // 返回：{ inputs: ['-i', url1, '-i', url2, ...], filter: "concat=n=2:v=0:a=1[outa]" }
-  if (!Array.isArray(audioUrls) || audioUrls.length === 0) {
-    throw new Error('audio_urls must be a non-empty array');
-  }
-  const inputs = [];
-  for (const u of audioUrls) {
-    inputs.push('-i', u);
-  }
-  const n = audioUrls.length;
-  const filter = `concat=n=${n}:v=0:a=1[outa]`;
-  return { inputs, filter };
-}
-
-// 简单伪动效（可选）
-// mode: 'none' | 'subtle' | 'verticalSubtle'
-// size: {w,h}, fps: number
-function buildMotionFilter(mode, size, fps) {
-  const { w, h } = size;
-  if (mode === 'verticalSubtle') {
-    return [
-      `[0:v]`,
-      `scale=ceil(${w}*1.22):ceil(${h}*1.22),`,
-      `crop=${w}:${h}:`,
-      `x='(in_w-out_w)/2 + 20*sin(t*0.25) + 5*sin(t*4.2)':`,
-      `y='(in_h-out_h)/2 + 16*sin(t*0.20) + 4*sin(t*3.5)',`,
-      `rotate='0.005*sin(1.7*t)+0.002*cos(9*t)',`,
-      `eq=contrast=1.06:brightness=-0.04:saturation=0.92,`,
-      `noise=alls=7:allf=t,`,
-      `rgbashift=rh=2:rv=2:gh=-2:gv=-2,`,
-      `vignette=0.12:0.65,`,
-      `fps=${fps},format=yuv420p[vbg]`
-    ].join('');
-  }
-  if (mode === 'subtle') {
-    return [
-      `[0:v]`,
-      `scale=ceil(${w}*1.12):ceil(${h}*1.12),`,
-      `crop=${w}:${h}:`,
-      `x='(in_w-out_w)/2 + 12*sin(t*0.25) + 3*sin(t*3.0)':`,
-      `y='(in_h-out_h)/2 +  8*sin(t*0.21) + 2*sin(t*2.5)',`,
-      `eq=contrast=1.05:brightness=-0.03:saturation=0.95,`,
-      `vignette=0.1:0.6,`,
-      `fps=${fps},format=yuv420p[vbg]`
-    ].join('');
-  }
-  // none：只做尺寸格式化
-  return [`[0:v]scale=${w}:${h},fps=${fps},format=yuv420p[vbg]`].join('');
-}
-
-// --------------- 健康检查 & 调试 ---------------
-app.get('/', (_req, res) => res.status(200).send('OK'));
-app.get('/healthz', (_req, res) => res.json({ ok: true, ts: Date.now() }));
-app.get('/__debug__/ls', (_req, res) => {
-  try {
-    const files = fs.readdirSync(OUTPUT_DIR).sort();
-    res.json({ OUTPUT_DIR, files });
-  } catch (e) {
-    res.status(500).json({ error: String(e) });
-  }
+// 根路由
+app.get('/', (req, res) => {
+  res.json({ ok: true, msg: 'ffmpeg-service is running', routes: ['/make/segments (POST)', '/output/<file>', '/__debug__/ls'] });
 });
 
-// --------------- 主路由：单图 + 多音频顺序拼接 ---------------
-/**
- * POST /make/segments
- * body:
- * {
- *   "image_url": "<必填> 单张图片直链（png/jpg）",
- *   "audio_urls": ["<必填> 多段 mp3 直链，按顺序拼接"],
- *   "outfile_prefix": "demo_cli",             // 可选，默认 "video"
- *   "resolution": "1280x720" | "1080x1920",   // 可选，默认 "1280x720"
- *   "fps": 30,                                // 可选，默认 30
- *   "motion": "none" | "subtle" | "verticalSubtle"  // 可选，默认 'none'
- * }
- */
+// 列出 /tmp 下的媒体文件，便于调试
+app.get('/__debug__/ls', (req, res) => {
+  const files = fs.readdirSync(OUTPUT_DIR).filter(f => /\.(mp4|mov|m4a|mp3|aac|srt|vtt)$/i.test(f));
+  res.json({ dir: OUTPUT_DIR, files });
+});
+
+// 小工具：构造运动风格对应的滤镜片段
+function motionToFilter(motion, resW, resH, fps) {
+  // 给几个常用档位；不传则返回基础缩放裁剪
+  const base =
+    `scale=${resW}:${resH}:force_original_aspect_ratio=increase,` +
+    `crop=${resW}:${resH},fps=${fps}`;
+
+  if (!motion || motion === 'none') return base;
+
+  if (motion === 'verticalSubtle') {
+    return (
+      base +
+      `,scale=ceil(${resW}*1.18):ceil(${resH}*1.18),` + // 放大给抖动留空间
+      `crop=${resW}:${resH}:` +
+      `x='(in_w-out_w)/2 + 22*sin(t*0.22) + 4*sin(t*3.5)':` +
+      `y='(in_h-out_h)/2 + 16*sin(t*0.19) + 3*sin(t*2.8)',` +
+      `rotate='0.004*sin(2*t)+0.002*cos(7*t)',` +
+      `eq=contrast=1.06:brightness=-0.04:saturation=0.92,` +
+      `noise=alls=9:allf=t,rgbashift=rh=2:rv=2:gh=-2:gv=-2`
+    );
+  }
+
+  if (motion === 'psychoFlicker') {
+    return (
+      base +
+      `,scale=ceil(${resW}*1.22):ceil(${resH}*1.22),` +
+      `crop=${resW}:${resH}:` +
+      `x='(in_w-out_w)/2 + 20*sin(t*0.25) + 5*sin(t*4.2)':` +
+      `y='(in_h-out_h)/2 + 16*sin(t*0.20) + 4*sin(t*3.5)',` +
+      `rotate='0.005*sin(1.7*t)+0.002*cos(9*t)',` +
+      `eq=contrast=1.12:brightness='-0.06+0.04*sin(13*t)':saturation=0.8,` +
+      `tmix=frames=4:weights=1 1.5 1.5 1,` +
+      `rgbashift=rh=4:rv=3:gh=-4:gv=-3`
+    );
+  }
+
+  // 未知值兜底
+  return base;
+}
+
+// 生成视频
 app.post('/make/segments', async (req, res) => {
-  const {
-    image_url,
-    audio_urls,
-    outfile_prefix = 'video',
-    resolution = '1280x720',
-    fps = 30,
-    motion = 'none'
-  } = req.body || {};
-
-  if (!image_url || !Array.isArray(audio_urls) || audio_urls.length === 0) {
-    return res.status(400).json({ ok: false, error: 'image_url and audio_urls[] are required' });
-  }
-
-  // 解析分辨率
-  const m = String(resolution).match(/^(\d+)x(\d+)$/i);
-  if (!m) return res.status(400).json({ ok: false, error: 'resolution must be like 1280x720' });
-  const size = { w: parseInt(m[1], 10), h: parseInt(m[2], 10) };
-
-  // 输出文件
-  const stamp = Date.now();
-  const filename = `${outfile_prefix}_${stamp}.mp4`;
-  const outfile = path.join(OUTPUT_DIR, filename);
-
   try {
-    // 构建音频输入和 concat
-    const { inputs: audioInputs, filter: audioConcat } = buildAudioConcatInputs(audio_urls);
+    const {
+      image_url,
+      audio_urls = [],
+      outfile_prefix = 'out',
+      resolution = '1080x1920',
+      fps = 30,
+      motion = 'verticalSubtle',
+      // 可扩展的音频效果开关（可选）
+      audio_fx = { highpass: true, lowpass: true, echo: true, limiter: 0.9 },
+      // 可选字幕（srt/vtt 的直链）
+      subtitle_url
+    } = req.body || {};
 
-    // 伪动效（视频侧）
-    const vFilter = buildMotionFilter(motion, size, fps);
+    if (!image_url || !audio_urls.length) {
+      return res.status(400).json({ error: 'image_url 和 audio_urls 必填' });
+    }
 
-    // 组装 filter_complex：
-    //   [0:v]...(vFilter)->[vbg]
-    //   若有多音频：concat n=audios -> [outa]
-    //   最终 map [vbg] + [outa]
-    const filterLines = [];
-    filterLines.push(vFilter);
-    filterLines.push(audioConcat);
-    const filterComplex = `${filterLines.join(';')}`;
+    const [resW, resH] = resolution.split('x').map(Number);
+    if (!resW || !resH) {
+      return res.status(400).json({ error: 'resolution 格式应为 1080x1920 这种' });
+    }
 
-    // ffmpeg 参数
-    const args = [
-      '-y',
-      '-loop', '1',
-      '-i', image_url,
-      ...audioInputs,
-      '-filter_complex', filterComplex,
-      '-map', '[vbg]',
-      '-map', '[outa]',
-      '-c:v', 'libx264',
-      '-preset', 'veryfast',
-      '-crf', '18',
-      '-c:a', 'aac',
-      '-b:a', '192k',
-      '-shortest',
-      outfile
-    ];
+    // 输出文件名
+    const ts = Date.now();
+    const outName = `${outfile_prefix}_${ts}.mp4`;
+    const outPath = path.join(OUTPUT_DIR, outName);
 
-    // 调用 ffmpeg（Render 镜像已预装；若自建，需要确保 ffmpeg 在 PATH）
-    const { stderr } = await sh('ffmpeg', args);
-    // 可选日志：console.log(stderr);
+    // 组装 ffmpeg 参数
+    const args = [];
 
-    const base = publicBaseUrl(req);
-    const file_url = `${base}/output/${filename}`;
-    return res.json({ ok: true, file_url, resolution, fps, motion });
-  } catch (err) {
-    console.error('[make/segments] error:', err.stderr || err.message || err);
-    return res.status(500).json({
-      ok: false,
-      error: String(err.message || err),
-      stderr: err.stderr ? String(err.stderr).slice(0, 2000) : undefined
+    // 输入：图片（循环一帧做底）
+    args.push('-y', '-loop', '1', '-i', image_url);
+
+    // 输入：音频，取第一条（如需拼接多条可按你以前的做法扩展）
+    args.push('-i', audio_urls[0]);
+
+    // 视频滤镜
+    const vf = motionToFilter(motion, resW, resH, fps);
+    args.push('-filter_complex', `[0:v]${vf},format=yuv420p[v]`);
+    args.push('-map', '[v]');
+    args.push('-map', '1:a');
+
+    // 视频编码
+    args.push('-c:v', 'libx264', '-preset', 'veryfast', '-crf', '18');
+
+    // 音频滤镜
+    const af = [];
+    if (audio_fx?.highpass) af.push('highpass=f=120');
+    if (audio_fx?.lowpass) af.push('lowpass=f=6000');
+    if (audio_fx?.echo) af.push('aecho=0.7:0.88:45:0.25');
+    const lim = Number(audio_fx?.limiter || 0);
+    if (lim && lim >= 0.0625 && lim <= 1) af.push(`alimiter=limit=${lim}`);
+    if (af.length) {
+      args.push('-af', af.join(','));
+    }
+
+    // 音频编码
+    args.push('-c:a', 'aac', '-b:a', '192k');
+
+    // 字幕（外挂到 mp4 容器里；注：很多平台更喜欢烧录字幕或生成双版本）
+    if (subtitle_url) {
+      // 注意：这会当作“软字幕”轨；如果你想“烧录”请改为在 filter_complex 中使用 subtitles=。
+      args.push('-i', subtitle_url);
+      args.push('-c:s', 'mov_text');      // mp4 的字幕编码
+      args.push('-map', '2:0');           // 将第三个输入作为字幕
+    }
+
+    args.push('-shortest', outPath);
+
+    // 启动 ffmpeg
+    console.log('Running ffmpeg:', 'ffmpeg', args.join(' '));
+    const ff = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+
+    // 把日志打到 Render logs 方便你观察
+    ff.stdout.on('data', (d) => process.stdout.write(d));
+    ff.stderr.on('data', (d) => process.stderr.write(d));
+
+    ff.on('close', (code) => {
+      if (code === 0) {
+        // 返回可直接访问的完整 URL
+        const file_url = `${process.env.RENDER_EXTERNAL_URL || ''}/output/${outName}`;
+        return res.json({ file_url, name: outName });
+      }
+      return res.status(500).json({ error: 'ffmpeg failed', code });
     });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message || 'server error' });
   }
 });
 
-// --------------- 兜底 ---------------
-app.use((req, res) => {
-  res.status(404).json({ ok: false, error: `No route: ${req.method} ${req.originalUrl}` });
-});
-
-// --------------- 启动 ---------------
+// Render 注入端口（本地运行用 10000）
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`[ready] listening on ${PORT}`);
