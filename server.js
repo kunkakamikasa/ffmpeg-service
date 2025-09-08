@@ -1,124 +1,134 @@
 import express from "express";
-import bodyParser from "body-parser";
-import fs from "fs";
 import { exec } from "child_process";
+import { promisify } from "util";
+import fs from "fs";
 import path from "path";
-import fetch from "node-fetch";
 
 const app = express();
-app.use(bodyParser.json({ limit: "20mb" }));
+const execAsync = promisify(exec);
 
-// 输出目录
-const OUTPUT_DIR = "/opt/render/project/src/output";
-if (!fs.existsSync(OUTPUT_DIR)) {
-  fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+app.use(express.json());
+
+/**
+ * 健康检查
+ */
+app.get(["/", "/health", "/healthz"], (req, res) => {
+  res.type("text").send("ok");
+});
+
+/**
+ * 构造滤镜字符串
+ */
+function buildFilter(opts = {}) {
+  const {
+    resolution = "1280x720",
+    fps = 30,
+    contrast,
+    brightness,
+    saturation,
+    vignette,
+    noise,
+    rgbashift,
+    rotate,
+  } = opts;
+
+  let filters = [];
+
+  // 基础
+  filters.push(`scale=${resolution.split("x")[0]}:${resolution.split("x")[1]}`);
+  filters.push(`fps=${fps}`);
+  filters.push("format=yuv420p");
+
+  // 样式参数
+  if (contrast || brightness || saturation) {
+    filters.push(
+      `eq=${contrast ? `contrast=${contrast}:` : ""}${
+        brightness ? `brightness=${brightness}:` : ""
+      }${saturation ? `saturation=${saturation}` : ""}`
+        .replace(/:+$/, "") // 去掉多余的冒号
+    );
+  }
+
+  if (vignette) filters.push(`vignette=${vignette}`);
+  if (noise) filters.push(`noise=alls=${noise}:allf=t`);
+  if (rgbashift)
+    filters.push(
+      `rgbashift=rh=${rgbashift.rh || 0}:rv=${rgbashift.rv || 0}:gh=${
+        rgbashift.gh || 0
+      }:gv=${rgbashift.gv || 0}`
+    );
+  if (rotate) filters.push(`rotate='${rotate}'`);
+
+  return `[0:v]${filters.join(",")}[v]`;
 }
 
-// 基础 URL（Render 环境变量里配置 PUBLIC_BASE_URL）
-const BASE_URL = process.env.PUBLIC_BASE_URL || "";
-
-// 下载远程文件到 /tmp
-async function downloadToTmp(url, ext = "") {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Download failed: ${url}`);
-  const buf = Buffer.from(await res.arrayBuffer());
-  const tmp = `/tmp/${Date.now()}_${Math.random().toString(36).slice(2)}${ext}`;
-  fs.writeFileSync(tmp, buf);
-  return tmp;
-}
-
-// -------------------- 路由 --------------------
-
-// 健康检查
-app.get("/healthz", (_req, res) => res.status(200).send("OK"));
-
-// 根路径
-app.get("/", (_req, res) => res.status(200).send("FFmpeg service is running"));
-
-// 制作视频
+/**
+ * 生成视频 /make/segments
+ */
 app.post("/make/segments", async (req, res) => {
   try {
-    const { image_url, audio_urls, outfile_prefix, style, subtitles } = req.body;
+    const {
+      image_url,
+      audio_urls,
+      outfile_prefix = "output",
+      resolution = "1280x720",
+      fps = 30,
+      style = {},
+      subtitle_url,
+    } = req.body;
+
     if (!image_url || !audio_urls || audio_urls.length === 0) {
-      return res.status(400).json({ error: "image_url and audio_urls required" });
-    }
-
-    // 下载图像
-    const imgFile = await downloadToTmp(image_url, path.extname(image_url) || ".png");
-
-    // 合并多个音频
-    let audioFile;
-    if (audio_urls.length === 1) {
-      audioFile = await downloadToTmp(audio_urls[0], ".mp3");
-    } else {
-      const parts = [];
-      for (const u of audio_urls) {
-        parts.push(await downloadToTmp(u, ".mp3"));
-      }
-      const listFile = `/tmp/list_${Date.now()}.txt`;
-      fs.writeFileSync(listFile, parts.map(p => `file '${p}'`).join("\n"));
-      audioFile = `/tmp/concat_${Date.now()}.mp3`;
-      await new Promise((resolve, reject) => {
-        exec(`ffmpeg -y -f concat -safe 0 -i ${listFile} -c copy ${audioFile}`, (err) => {
-          if (err) reject(err); else resolve();
-        });
+      return res.status(400).json({
+        error: "image_url 和 audio_urls 必填，且 audio_urls 至少 1 个",
       });
     }
 
-    // 样式参数
-    const scaleFactor = style?.scaleFactor || 1.0;
-    const contrast = style?.contrast ?? 1.0;
-    const brightness = style?.brightness ?? 0.0;
-    const saturation = style?.saturation ?? 1.0;
-    const fps = style?.fps || 30;
-    const crf = style?.crf || 20;
-    const audio_bitrate = style?.audio_bitrate || "192k";
+    const safeName = `${outfile_prefix}_${Date.now()}`;
+    const outFile = `/tmp/${safeName}.mp4`;
 
-    let filters = `[0:v]scale=ceil(1080*${scaleFactor}):ceil(1920*${scaleFactor}),`;
-    filters += `crop=1080:1920:x='(in_w-out_w)/2':y='(in_h-out_h)/2',`;
-    filters += `eq=contrast=${contrast}:brightness=${brightness}:saturation=${saturation},`;
-    filters += `fps=${fps},format=yuv420p[v]`;
+    // 构造输入
+    let inputs = [`-loop 1 -i "${image_url}"`];
+    audio_urls.forEach((url) => inputs.push(`-i "${url}"`));
 
-    // 输出文件
-    const outName = `${outfile_prefix || "out"}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.mp4`;
-    const outPath = path.join(OUTPUT_DIR, outName);
+    // 构造滤镜
+    const filterComplex = buildFilter({ resolution, fps, ...style });
 
-    // 临时字幕文件
-    let subsCmd = "";
-    if (subtitles?.srt_url || subtitles?.srt_text) {
-      const srtFile = `/tmp/subs_${Date.now()}.srt`;
-      if (subtitles.srt_url) {
-        const subsRes = await fetch(subtitles.srt_url);
-        if (!subsRes.ok) throw new Error("Subtitle download failed");
-        fs.writeFileSync(srtFile, Buffer.from(await subsRes.arrayBuffer()));
-      } else if (subtitles.srt_text) {
-        fs.writeFileSync(srtFile, subtitles.srt_text);
-      }
-      subsCmd = `-vf "subtitles=${srtFile}"`;
+    // 基础命令
+    let cmd = `ffmpeg -y ${inputs.join(" ")} -filter_complex "${filterComplex}" -map "[v]" -map 1:a -c:v libx264 -preset veryfast -crf 18 -c:a aac -shortest ${outFile}`;
+
+    // 如果有字幕
+    if (subtitle_url) {
+      cmd = `ffmpeg -y ${inputs.join(
+        " "
+      )} -filter_complex "${filterComplex}" -map "[v]" -map 1:a -vf "subtitles='${subtitle_url}'" -c:v libx264 -preset veryfast -crf 18 -c:a aac -shortest ${outFile}`;
     }
 
-    // ffmpeg 命令
-    const cmd = `ffmpeg -y -i ${imgFile} -i ${audioFile} -filter_complex "${filters}" -map "[v]" -map 1:a -c:v libx264 -preset veryfast -crf ${crf} -c:a aac -b:a ${audio_bitrate} -shortest ${subsCmd} ${outPath}`;
+    console.log("Running:", cmd);
+    await execAsync(cmd);
 
-    await new Promise((resolve, reject) => {
-      exec(cmd, (err, stdout, stderr) => {
-        if (err) reject(stderr || err); else resolve(stdout);
-      });
-    });
+    // 输出目录
+    const outDir = "/tmp/output";
+    if (!fs.existsSync(outDir)) fs.mkdirSync(outDir);
+    fs.renameSync(outFile, path.join(outDir, `${safeName}.mp4`));
 
-    const fullUrl = BASE_URL ? `${BASE_URL}/output/${outName}` : `/output/${outName}`;
-    res.json({ ok: true, file: `/output/${outName}`, full_url: fullUrl });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: String(e) });
+    // 返回完整 URL
+    const publicBase = process.env.PUBLIC_BASE_URL || "";
+    const fileUrl = `${publicBase}/output/${safeName}.mp4`;
+
+    return res.json({ file_url: fileUrl });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: err.message });
   }
 });
 
-// 静态文件输出
-app.use("/output", express.static(OUTPUT_DIR));
+/**
+ * 静态托管
+ */
+app.use("/output", express.static("/tmp/output"));
 
-// 启动服务
+// 启动
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log(`FFmpeg service running on port ${PORT}`);
+  console.log(`[ready] listening on ${PORT}`);
 });
