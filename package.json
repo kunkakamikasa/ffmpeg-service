@@ -1,14 +1,17 @@
 {
   "name": "ffmpeg-service",
   "version": "1.0.0",
+  "description": "Simple image+audio(+srt) to video service with basic motions",
   "main": "server.cjs",
   "scripts": {
     "start": "node server.cjs"
   },
   "dependencies": {
-    "express": "^4.19.2"
-  },
-  "engines": {
-    "node": ">=18"
+    "body-parser": "^1.20.2",
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "morgan": "^1.10.0",
+    "node-fetch": "^2.7.0",
+    "uuid": "^9.0.1"
   }
 }
