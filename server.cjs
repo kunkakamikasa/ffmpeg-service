@@ -1,68 +1,53 @@
-/* Minimal, stable baseline: image + audio -> mp4 (shake/pan/zoom optional; SRT optional) */
+// server.cjs
 const express = require('express');
-const morgan = require('morgan');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
-const crypto = require('crypto');
-const { Readable } = require('stream');
+const fetch = require('node-fetch');
 
 const app = express();
-app.use(express.json({ limit: '2mb' }));
-app.use(morgan('tiny'));
+app.use(express.json());
 
-const TMP = '/tmp';
-const PORT = process.env.PORT || 10000;
-const FFMPEG = process.env.FFMPEG_PATH || 'ffmpeg';
+// 输出目录
+const OUTDIR = '/tmp';
+if (!fs.existsSync(OUTDIR)) fs.mkdirSync(OUTDIR, { recursive: true });
 
-function uid() {
-  return `${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
-}
-
-async function downloadToTmp(url, forcedExt = '') {
-  if (!url) throw new Error('empty url');
-  const u = new URL(url);
-  const ext = forcedExt || path.extname(u.pathname) || '';
-  const outfile = path.join(TMP, `${uid()}${ext}`);
+// 工具函数：下载远程文件到本地临时目录
+async function downloadFile(url, suffix) {
   const res = await fetch(url);
-
-  if (!res.ok || !res.body) {
-    throw new Error(`download failed: ${res.status} ${res.statusText}`);
-  }
-
-  const nodeReadable = Readable.fromWeb(res.body);
-  await new Promise((resolve, reject) => {
-    const w = fs.createWriteStream(outfile);
-    nodeReadable.pipe(w);
-    nodeReadable.on('error', reject);
-    w.on('finish', resolve);
-    w.on('error', reject);
-  });
-
-  return outfile;
+  if (!res.ok) throw new Error(`download failed ${url}`);
+  const filePath = path.join(OUTDIR, `${Date.now()}_${Math.random().toString(36).slice(2)}${suffix}`);
+  const buf = await res.buffer();
+  fs.writeFileSync(filePath, buf);
+  return filePath;
 }
 
+// 构造滤镜链
 function buildFilter({ W, H, fps, motion, srtPath }) {
   let chain;
   if (motion === 'shake') {
-    chain = `[0:v]scale=${W}:${H}:force_original_aspect_ratio=cover,` +
-            `crop=${W}:${H}:x=(in_w-out_w)/2+12*sin(2*t):y=(in_h-out_h)/2+12*sin(1.5*t),` +
-            `fps=${fps}`;
+    chain =
+      `[0:v]scale=${W}:${H}:force_original_aspect_ratio=increase,` +
+      `crop=${W}:${H}:x=(in_w-out_w)/2+12*sin(2*t):y=(in_h-out_h)/2+12*sin(1.5*t),` +
+      `fps=${fps}`;
   } else if (motion === 'pan') {
-    chain = `[0:v]scale=${W}:${H}:force_original_aspect_ratio=cover,` +
-            `crop=${W}:${H}:x=(in_w-out_w)/2+150*sin(0.3*t):y=(in_h-out_h)/2,` +
-            `fps=${fps}`;
+    chain =
+      `[0:v]scale=${W}:${H}:force_original_aspect_ratio=increase,` +
+      `crop=${W}:${H}:x=(in_w-out_w)/2+150*sin(0.3*t):y=(in_h-out_h)/2,` +
+      `fps=${fps}`;
   } else if (motion === 'zoom') {
-    // 轻微放大至 1.12 倍；zoompan 自带输出尺寸 s=WxH
-    chain = `[0:v]zoompan=z='min(zoom+0.002,1.12)':d=1:` +
-            `x='iw/2-(iw/2)/zoom':y='ih/2-(ih/2)/zoom':s=${W}x${H},fps=${fps}`;
+    chain =
+      `[0:v]zoompan=z='min(zoom+0.002,1.12)':d=1:` +
+      `x='iw/2-(iw/2)/zoom':y='ih/2-(ih/2)/zoom':s=${W}x${H},fps=${fps}`;
   } else {
-    // 默认不动，只做 cover & 裁切
-    chain = `[0:v]scale=${W}:${H}:force_original_aspect_ratio=cover,crop=${W}:${H},fps=${fps}`;
+    // 静止图 + 裁切
+    chain =
+      `[0:v]scale=${W}:${H}:force_original_aspect_ratio=increase,` +
+      `crop=${W}:${H},fps=${fps}`;
   }
 
+  // 如果有字幕
   if (srtPath) {
-    // 路径转义（冒号/反斜杠/单引号）
     const esc = srtPath.replace(/\\/g, '\\\\').replace(/:/g, '\\:').replace(/'/g, "\\'");
     chain += `,subtitles='${esc}':force_style='Fontsize=28,Outline=1,Shadow=0'`;
   }
@@ -71,85 +56,80 @@ function buildFilter({ W, H, fps, motion, srtPath }) {
   return chain;
 }
 
-app.get('/', (_, res) => res.type('text/plain').send('OK'));
-app.get('/healthz', (_, res) => res.json({ ok: true }));
-
-// 列目录调试（看到 files 就说明静态托管在工作）
-app.get('/__debug__/ls', (_, res) => {
-  const files = fs.readdirSync(TMP).sort().slice(-50);
-  res.json({ files });
-});
-
-// 静态托管 /tmp 到 /output
-app.use('/output', express.static(TMP, { fallthrough: false }));
-
+// 路由：生成视频
 app.post('/make/segments', async (req, res) => {
-  const t0 = Date.now();
   try {
     const {
       image_url,
       audio_urls,
       outfile_prefix = 'out',
-      resolution = '1080x1920',
+      resolution = '720x1280',
       fps = 30,
       motion = 'none',
-      video = {},
-      srt_url // 可选
-    } = req.body || {};
+      srt_url,
+      video = {}
+    } = req.body;
 
     if (!image_url || !audio_urls || !audio_urls.length) {
-      return res.status(400).json({ error: 'image_url & audio_urls are required' });
+      return res.status(400).json({ error: 'image_url and audio_urls required' });
     }
 
-    const [W, H] = String(resolution).split('x').map(n => parseInt(n, 10));
-    if (!W || !H) return res.status(400).json({ error: 'bad resolution' });
+    const [W, H] = resolution.split('x').map(Number);
 
-    // 先把远端资源拉到 /tmp，避免 ffmpeg 直连外网导致不稳定
-    const [imgLocal, audLocal] = await Promise.all([
-      downloadToTmp(image_url),
-      downloadToTmp(audio_urls[0])
-    ]);
-    const srtLocal = srt_url ? await downloadToTmp(srt_url, '.srt') : null;
+    // 下载输入文件
+    const imgPath = await downloadFile(image_url, path.extname(image_url) || '.png');
+    const audioPaths = [];
+    for (const url of audio_urls) {
+      audioPaths.push(await downloadFile(url, '.mp3'));
+    }
+    let srtPath = null;
+    if (srt_url) srtPath = await downloadFile(srt_url, '.srt');
 
-    const outFile = path.join(TMP, `${outfile_prefix}_${Date.now()}.mp4`);
-    const filter = buildFilter({ W, H, fps, motion, srtPath: srtLocal });
+    const outfile = path.join(OUTDIR, `${outfile_prefix}_${Date.now()}.mp4`);
 
+    // 构建 filter
+    const filter = buildFilter({ W, H, fps, motion, srtPath });
+
+    // ffmpeg 参数
     const args = [
       '-y',
-      '-loop', '1', '-i', imgLocal,
-      '-i', audLocal,
+      '-loop', '1',
+      '-i', imgPath,
+      '-i', audioPaths[0], // 先只支持单音轨
       '-filter_complex', filter,
-      '-map', '[v]', '-map', '1:a',
+      '-map', '[v]',
+      '-map', '1:a',
       '-c:v', 'libx264',
       '-preset', video.preset || 'veryfast',
-      '-crf', String(video.crf ?? 20),
-      '-c:a', 'aac', '-b:a', '128k',
+      '-crf', video.crf || '23',
+      '-c:a', 'aac',
+      '-b:a', '128k',
       '-shortest',
-      '-threads', String(video.threads ?? 1),
-      outFile
+      outfile
     ];
 
-    console.log('[ffmpeg args]', args.join(' '));
+    console.log('Running ffmpeg', args.join(' '));
 
-    const ff = spawn(FFMPEG, args, { stdio: ['ignore', 'pipe', 'pipe'] });
-
-    ff.stdout.on('data', d => console.log('[ffmpeg]', d.toString().trim()));
-    ff.stderr.on('data', d => console.log('[ffmpeg]', d.toString().trim()));
-
-    const code = await new Promise((resolve) => ff.on('close', resolve));
-
-    if (code !== 0) {
-      return res.status(500).json({ error: `ffmpeg exit ${code}` });
-    }
-
-    const file_url = `${req.protocol}://${req.get('host')}/output/${path.basename(outFile)}`;
-    res.json({ file_url, took_ms: Date.now() - t0 });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: String(e.message || e) });
+    const ff = spawn('ffmpeg', args);
+    ff.stderr.on('data', d => console.log('[ffmpeg]', d.toString()));
+    ff.on('close', code => {
+      if (code !== 0) {
+        return res.status(500).json({ error: `ffmpeg exit ${code}` });
+      }
+      const fileUrl = `${req.protocol}://${req.get('host')}/output/${path.basename(outfile)}`;
+      res.json({ file_url: fileUrl });
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`[ready] listening on ${PORT}`);
-});
+// 静态文件托管
+app.use('/output', express.static(OUTDIR));
+
+// 健康检查
+app.get('/healthz', (req, res) => res.json({ ok: true }));
+
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => console.log('FFmpeg service running on', PORT));
