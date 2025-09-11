@@ -7,12 +7,11 @@
 // - subtitles: SRT URL or captions array (auto SRT)
 // - returns full URL to /output/<file>.mp4
 //
-// Requirements on Render:
-// - Web Service (Node)
+// Render settings (example):
 // - Start command: node server.cjs
-// - Environment: PUBLIC_BASE_URL=https://<your-service>.onrender.com
+// - ENV: PUBLIC_BASE_URL=https://<your-service>.onrender.com
 //
-// Note: writes to /tmp only (ephemeral on Render)
+// NOTE: writes only to /tmp (ephemeral on Render)
 
 const express = require("express");
 const { spawn } = require("child_process");
@@ -23,9 +22,7 @@ const crypto = require("crypto");
 const { pipeline } = require("stream");
 const { promisify } = require("util");
 const streamPipeline = promisify(pipeline);
-
-// Node 18+ has global fetch; if not, uncomment node-fetch
-// const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
+const axios = require("axios"); // ← use axios for robust streaming downloads
 
 const app = express();
 app.use(express.json({ limit: "4mb" }));
@@ -34,17 +31,32 @@ const OUT_DIR = "/tmp/output";
 const TMP_DIR = "/tmp";
 fs.mkdirSync(OUT_DIR, { recursive: true });
 
+// Prefer user-provided public URL; fall back to Render's external URL if available
 function baseUrl() {
-  // Prefer env, fallback to Render provided host header at runtime
-  return process.env.PUBLIC_BASE_URL || "";
+  return (
+    process.env.PUBLIC_BASE_URL ||
+    process.env.RENDER_EXTERNAL_URL ||
+    ""
+  );
 }
 function uid(n = 6) {
   return crypto.randomBytes(n).toString("hex");
 }
+
+// --- robust downloader using axios stream (works on any Node) ---
 async function downloadTo(url, destPath) {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`download failed ${res.status} ${url}`);
-  await streamPipeline(res.body, fs.createWriteStream(destPath));
+  const resp = await axios.get(url, {
+    responseType: "stream",
+    timeout: 30000,
+    maxRedirects: 5,
+    headers: { "User-Agent": "ffmpeg-service/1.0" },
+  });
+  await new Promise((resolve, reject) => {
+    const ws = fs.createWriteStream(destPath);
+    resp.data.pipe(ws);
+    ws.on("finish", resolve);
+    ws.on("error", reject);
+  });
   return destPath;
 }
 
@@ -55,48 +67,39 @@ function parseResolution(s = "720x1280") {
 }
 
 function buildMotion({ motion = "none" }, W, H) {
-  // Base: make the image slightly larger then crop to W×H with motion
-  // Safer path (no force_original_aspect_ratio flags that differ by ffmpeg build):
-  // 1) scale to fit (cover) by overscaling 1.06 and center-cropping with expressions
-  // 2) add motion via crop x/y or zoompan
+  // 先轻微放大，再裁切 + 伪动销（避免黑边 & 兼容不同 ffmpeg build）
   const pre = `scale=${W * 1.06}:${H * 1.06},setsar=1`;
   if (motion === "shake") {
     const crop = `crop=${W}:${H}:x='(in_w-${W})/2+5*sin(2*t)':y='(in_h-${H})/2+5*sin(1.5*t)'`;
     return `${pre},${crop}`;
   }
   if (motion === "pan") {
-    // 左->右缓慢平移
     const crop = `crop=${W}:${H}:x='(in_w-${W})/2+20*sin(t*0.3)':y='(in_h-${H})/2'`;
     return `${pre},${crop}`;
   }
   if (motion === "zoom") {
-    // 温柔缩放 1.0~1.05 来回
     const zoom = `zoompan=z='1+0.05*sin(t*0.5)':d=1:x='iw/2-(iw/${W})*0.5':y='ih/2-(ih/${H})*0.5'`;
-    // zoompan 输出尺寸不固定，这里再强行裁到目标
     return `${pre},${zoom},scale=${W}:${H}`;
   }
   return `${pre},crop=${W}:${H}`;
 }
 
 function buildFilterChain(options, W, H, fps, inputs) {
-  // inputs: { imgIndex: 0, audioCount: N }
+  // inputs: { audioCount: N }
   // 视频链从 [0:v] 开始
-  const vLabels = [];
   let chain = `[0:v]${buildMotion(options, W, H)}`;
 
-  // 滤镜
+  // 滤镜（可选）
   const f = options.filters || {};
-  // 提示：rgbashift 参数以像素为单位，这里给一个温和默认值
   if (f.rgbashift) {
     const amt = typeof f.rgbashift === "number" ? f.rgbashift : 2;
     chain += `,rgbashift=rg=${amt}:bg=${amt}:rb=${amt}:bb=${amt}`;
   }
   if (f.tmix) {
-    const frames = typeof f.tmix === "number" ? f.tmix : 2; // 2~3 比较稳
+    const frames = typeof f.tmix === "number" ? f.tmix : 2;
     chain += `,tmix=frames=${Math.max(2, Math.min(5, frames))}`;
   }
   if (f.glitchOverlay) {
-    // 用噪点模拟轻度“故障”叠加
     chain += `,noise=alls=10:allf=t+u`;
   }
   if (f.vignette) {
@@ -106,54 +109,40 @@ function buildFilterChain(options, W, H, fps, inputs) {
 
   // 帧率 & 像素格式
   chain += `,fps=${fps},format=yuv420p[v]`;
-  vLabels.push("[v]");
 
-  // 音频链：如果多个音频输入，使用 concat 滤镜顺序拼接
-  // 输入中，音频从 [1:a]...[N:a]
+  // 音频链：多段顺连拼接；单段做规范化；无音频则 anullsrc
   const aCount = inputs.audioCount || 0;
-  let audioMap = "1:a";
-  let aLabel = "[aud]";
   let afilters = "";
-
   if (aCount === 0) {
-    // 无音频就生成静音，防止某些播放器不兼容
     afilters = `anullsrc=r=44100:cl=mono[aud]`;
-    aLabel = "[aud]";
   } else if (aCount === 1) {
-    // 只有一个：标准化采样率/声道
     afilters = `[1:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,aresample=44100,pan=stereo|c0=c0|c1=c0[aud]`;
-    aLabel = "[aud]";
   } else {
-    // 多段音频：全部标准化再 concat
-    // 构造 [1:a][2:a]...[N:a] -> concat=n=N:v=0:a=1[aud]
-    const inputsSeq = Array.from({ length: aCount }, (_, i) => i + 1)
-      .map((idx) => {
-        return `[${idx}:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,aresample=44100[a${idx}]`;
-      })
+    const normSeq = Array.from({ length: aCount }, (_, i) => i + 1)
+      .map(
+        (idx) =>
+          `[${idx}:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,aresample=44100[a${idx}]`
+      )
       .join(";");
     const refs = Array.from({ length: aCount }, (_, i) => `[a${i + 1}]`).join("");
-    afilters = `${inputsSeq};${refs}concat=n=${aCount}:v=0:a=1[aud]`;
-    aLabel = "[aud]";
+    afilters = `${normSeq};${refs}concat=n=${aCount}:v=0:a=1[aud]`;
   }
 
-  // 字幕：若有 SRT 文件则在视频链尾部追加
+  // 字幕（若提供 SRT）
   if (options._srtPath) {
-    // 注意：路径要转义冒号、单引号
     const esc = options._srtPath.replace(/'/g, "\\\\'").replace(/:/g, "\\\\:");
-    // 用 libass：可设置外观
     chain = chain.replace(
       "[v]",
       `,subtitles='${esc}':force_style='Fontsize=${options.sub_fontsize || 28},Outline=${options.sub_outline || 1},PrimaryColour=&H00FFFFFF&'[v]`
     );
   }
 
-  // 汇总 filter_complex
-  const fc = `${chain};${afilters}`;
-  return { filterComplex: fc, vOut: vLabels[0], aOut: aLabel };
+  const filterComplex = `${chain};${afilters}`;
+  return { filterComplex, vOut: "[v]", aOut: "[aud]" };
 }
 
 async function ensureSrtFromCaptions(captions) {
-  // captions: [{text, start, end}]  start/end: 秒 或 "00:00:02,000" 皆可
+  // captions: [{text, start, end}]  start/end 可以是秒数或 "00:00:02,000"
   function toSrtTime(v) {
     if (typeof v === "number") {
       const ms = Math.max(0, Math.round(v * 1000));
@@ -208,9 +197,9 @@ app.post("/make/segments", async (req, res) => {
       video = {},
       filters = {},
 
-      // 字幕两种形态（二选一）
-      subtitle_url, // 传 SRT 直链
-      captions, // 传数组 [{text,start,end}]，自动转 SRT
+      // 字幕输入（二选一）
+      subtitle_url, // 外部 SRT 直链
+      captions, // [{text,start,end}] 自动转 SRT
       sub_fontsize,
       sub_outline,
     } = req.body || {};
@@ -249,28 +238,43 @@ app.post("/make/segments", async (req, res) => {
     // 组装 ffmpeg 参数
     const args = [
       "-y",
+      "-hide_banner",
+      "-nostdin",
+      "-loglevel",
+      "error",
+
       "-loop",
       "1",
       "-i",
       imgPath,
+
       // 追加每个音频为独立输入
       ...audios.flatMap((p) => ["-i", p]),
+
       "-filter_complex",
       "", // 占位，稍后填入
       "-map",
       "", // v
       "-map",
       "", // a
+
       "-c:v",
       "libx264",
       "-preset",
       String(video.preset || "veryfast"),
       "-crf",
       String(video.crf ?? 23),
+      "-pix_fmt",
+      "yuv420p",
+      "-threads",
+      String(video.threads || 1),
+
       "-c:a",
       "aac",
       "-b:a",
       "128k",
+
+      // 与最短输入对齐，避免拖尾
       "-shortest",
       outPath,
     ];
@@ -314,8 +318,9 @@ app.post("/make/segments", async (req, res) => {
       });
     });
 
-    const url =
-      (baseUrl() ? `${baseUrl()}/output/${outName}` : `/output/${outName}`);
+    const url = baseUrl()
+      ? `${baseUrl()}/output/${outName}`
+      : `/output/${outName}`;
 
     res.json({
       ok: true,
@@ -323,17 +328,18 @@ app.post("/make/segments", async (req, res) => {
       took_ms: Date.now() - startedAt,
     });
   } catch (err) {
-    // 精简返回 + 附带最后 20 行 stderr，方便排错
-    let tail = "";
+    // 精简返回 + 附带最后若干行 stderr/stack，方便排错
+    let detail = "";
     try {
-      tail = String(err.stack || err.message || err)
+      detail = String(err.stack || err.message || err)
         .split("\n")
         .slice(-20)
         .join("\n");
     } catch {}
-    return res
-      .status(500)
-      .json({ error: "ffmpeg failed", detail: tail.slice(-1500) });
+    return res.status(500).json({
+      error: "ffmpeg failed",
+      detail: detail.slice(-1500),
+    });
   }
 });
 
