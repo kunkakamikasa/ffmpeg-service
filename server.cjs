@@ -66,7 +66,7 @@ function buildFilter(resolution, fps, motion) {
   return { filter, outW, outH, outFPS };
 }
 
-// —— 合成接口（支持 subtitle_url + 可选样式） —— //
+// —— 合成接口（支持 subtitle_url + 可选样式 + FX） —— //
 app.post('/make/segments', async (req, res) => {
   const startedAt = Date.now();
   try {
@@ -79,7 +79,8 @@ app.post('/make/segments', async (req, res) => {
       motion = 'none',
       video = {},             // 编码参数
       subtitle_url = null,    // 字幕直链（.srt 或 .ass）
-      subtitles = {}          // 可选：{ charenc, force_style, fontsdir }
+      subtitles = {},         // 可选：{ charenc, force_style, fontsdir }
+      fx = {}                 // ★ 新增：伪特效参数
     } = req.body || {};
 
     if (!image_url || !audio_urls.length) {
@@ -91,6 +92,64 @@ app.post('/make/segments', async (req, res) => {
     // 下载素材
     const img = await downloadToTmp(image_url, 'png');
     const aud = await downloadToTmp(audio_url, 'mp3');
+
+    // 视频基础滤镜（中间标签 [v0]）
+    const { filter } = buildFilter(resolution, fps, motion);
+
+    // ★★★ 基于 fx 组装一段可选的滤镜链（从 [v0] 出发，输出 [vfx]）★★★
+    let baseLabel = '[v0]';
+    let fxParts = [];
+
+    // 颜色/对比预设
+    const preset = (fx.preset || '').toLowerCase();
+    if (preset === 'horror_cold') {
+      fxParts.push(`eq=saturation=0.65:contrast=1.12:brightness=-0.02:gamma=0.95`);
+      fxParts.push(`colorchannelmixer=rr=0.95:gg=1.00:bb=1.08:rb=0:gb=0:br=0`);
+    } else if (preset === 'horror_bloody') {
+      fxParts.push(`eq=saturation=0.80:contrast=1.20:brightness=-0.015:gamma=0.98`);
+      fxParts.push(`colorchannelmixer=rr=1.06:gg=0.98:bb=0.95:rg=0.02:bg=0.00:rb=0.02`);
+    } else if (preset === 'nightmare') {
+      fxParts.push(`eq=saturation=0.60:contrast=1.10:brightness=-0.03:gamma=0.90`);
+      fxParts.push(`colorchannelmixer=rr=0.95:gg=1.02:bb=0.98:rb=0.00:bg=0.02`);
+    } else if (preset === 'mono') {
+      fxParts.push(`hue=s=0`);
+    }
+
+    // 晕影（使用默认形状）
+    if (typeof fx.vignette === 'number' && fx.vignette > 0) {
+      fxParts.push(`vignette=PI/5`);
+    }
+
+    // 颗粒（noise 的稳定写法）
+    if (typeof fx.grain === 'number' && fx.grain > 0) {
+      const g = Math.min(30, Math.max(1, fx.grain|0));
+      fxParts.push(`noise=alls=${g}:allf=u`);
+    }
+
+    // 色差
+    if (typeof fx.aberration_px === 'number' && fx.aberration_px > 0) {
+      const px = Math.min(6, Math.max(1, fx.aberration_px|0));
+      fxParts.push(`chromashift=cbh=${px}:crh=-${px}`);
+    }
+
+    // 轻微模糊
+    if (typeof fx.blur === 'number' && fx.blur > 0) {
+      const b = Math.min(3, Math.max(0.3, fx.blur));
+      fxParts.push(`gblur=sigma=${b.toFixed(2)}`);
+    }
+
+    // 闪烁（正弦调亮度）
+    if (typeof fx.flicker_amp === 'number' && fx.flicker_amp > 0) {
+      const amp = Math.min(0.15, Math.max(0.01, fx.flicker_amp));
+      const freq = (typeof fx.flicker_freq === 'number' && fx.flicker_freq > 0) ? fx.flicker_freq : 1.3;
+      fxParts.push(`eq=brightness='${amp}*sin(2*PI*${freq}*t)'`);
+    }
+
+    let finalFilter = filter;
+    if (fxParts.length) {
+      finalFilter = `${filter};[v0]${fxParts.join(',')}[vfx]`;
+      baseLabel = '[vfx]';
+    }
 
     // （可选）下载字幕：保留原后缀（srt/ass），避免识别错误
     let subPath = null;
@@ -110,33 +169,23 @@ app.post('/make/segments', async (req, res) => {
       }
     }
 
-    // 视频滤镜（中间标签 [v0]）
-    const { filter } = buildFilter(resolution, fps, motion);
-
-    // 串接字幕滤镜（若有）
-    let finalFilter = filter;
-    let finalVideoLabel = '[v0]';
-
+    // （可选）串接字幕（接在 FX 之后）
+    let finalVideoLabel = baseLabel;
     if (subPath) {
-      // 处理样式与字符集
       const charenc = (subtitles.charenc || 'UTF-8').trim();
-      // 如果是 .ass 且未显式给 force_style，则尊重 ASS 文件内样式；否则使用传入或默认样式
       const forceStyle =
         (subIsASS && !subtitles.force_style)
           ? null
           : (subtitles.force_style || 'FontName=Arial,Fontsize=22,BorderStyle=1,Outline=2,Shadow=0,Alignment=2,MarginV=80');
-
       const fontsdir = subtitles.fontsdir ? String(subtitles.fontsdir) : null;
 
-      // 组装 subtitles 滤镜参数
       const subOpts = [`'${subPath}'`];
       if (charenc) subOpts.push(`charenc='${charenc}'`);
       if (fontsdir) subOpts.push(`fontsdir='${fontsdir}'`);
       if (forceStyle) subOpts.push(`force_style='${forceStyle}'`);
 
       const subFilter = `subtitles=${subOpts.join(':')}`;
-
-      finalFilter = `${filter};[v0]${subFilter},format=yuv420p[v]`;
+      finalFilter = `${finalFilter};${baseLabel}${subFilter},format=yuv420p[v]`;
       finalVideoLabel = '[v]';
     }
 
