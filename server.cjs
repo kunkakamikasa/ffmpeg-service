@@ -37,7 +37,6 @@ async function downloadToTmp(url, ext) {
 
 // —— 生成 ffmpeg 滤镜串 —— //
 // 返回：{ filter, outW, outH, outFPS }
-// 注意：这里的末端标签改成 [v0]，方便后续串接字幕；最终输出标签由调用处决定。
 function buildFilter(resolution, fps, motion) {
   const [W, H] = (resolution || '').split('x').map(n => parseInt(n, 10) || 0);
   const outW = Math.max(16, W || 720);
@@ -46,13 +45,11 @@ function buildFilter(resolution, fps, motion) {
 
   let cropXY = `x='(in_w-out_w)/2':y='(in_h-out_h)/2'`;
   if (motion === 'shake') {
-    // 轻微抖动
     cropXY = `x='(in_w-out_w)/2 + 6*sin(2*t)':y='(in_h-out_h)/2 + 6*sin(1.7*t)'`;
   } else if (motion === 'pan') {
-    // 缓慢水平平移
     cropXY = `x='(in_w-out_w)/2 + 20*sin(0.3*t)':y='(in_h-out_h)/2'`;
   } else if (motion === 'zoom') {
-    // 轻微呼吸式缩放（幅度很小，避免黑边）
+    // 轻微呼吸式缩放（幅度小，避免黑边）
   }
 
   const zoomPrefix = (motion === 'zoom')
@@ -69,7 +66,7 @@ function buildFilter(resolution, fps, motion) {
   return { filter, outW, outH, outFPS };
 }
 
-// —— 合成接口（新增：可选 subtitle_url） —— //
+// —— 合成接口（支持 subtitle_url + 可选样式） —— //
 app.post('/make/segments', async (req, res) => {
   const startedAt = Date.now();
   try {
@@ -80,8 +77,9 @@ app.post('/make/segments', async (req, res) => {
       resolution = '720x1280',
       fps = 24,
       motion = 'none',
-      video = {},            // 编码参数
-      subtitle_url = null    // ★ 新增：字幕直链（SRT）
+      video = {},             // 编码参数
+      subtitle_url = null,    // 字幕直链（.srt 或 .ass）
+      subtitles = {}          // 可选：{ charenc, force_style, fontsdir }
     } = req.body || {};
 
     if (!image_url || !audio_urls.length) {
@@ -94,13 +92,20 @@ app.post('/make/segments', async (req, res) => {
     const img = await downloadToTmp(image_url, 'png');
     const aud = await downloadToTmp(audio_url, 'mp3');
 
-    // （可选）下载字幕
-    let srtPath = null;
+    // （可选）下载字幕：保留原后缀（srt/ass），避免识别错误
+    let subPath = null;
+    let subIsASS = false;
     if (subtitle_url) {
       try {
-        srtPath = await downloadToTmp(subtitle_url, 'srt');
+        let guessed = 'srt';
+        try {
+          const p = new URL(subtitle_url).pathname;
+          const ext = (path.extname(p) || '').slice(1).toLowerCase();
+          if (ext === 'ass') guessed = 'ass';
+        } catch {}
+        subIsASS = (guessed === 'ass');
+        subPath = await downloadToTmp(subtitle_url, guessed);
       } catch (e) {
-        // 字幕下载失败不阻塞主流程；如需严格可改成直接 400
         console.warn('subtitle download failed:', e?.message || e);
       }
     }
@@ -108,20 +113,30 @@ app.post('/make/segments', async (req, res) => {
     // 视频滤镜（中间标签 [v0]）
     const { filter } = buildFilter(resolution, fps, motion);
 
-    // 如果有字幕：把 [v0] 再串接一次 subtitles 滤镜 → [v]
-    // 否则：直接把 [v0] 作为最终 [v]
+    // 串接字幕滤镜（若有）
     let finalFilter = filter;
     let finalVideoLabel = '[v0]';
 
-    if (srtPath) {
-      // 组装安全的 ASS 风格参数（可按需自行改色/描边/字体）
-      // 强烈建议你的 SRT 为 UTF-8，无 BOM。
-      const style =
-        "FontName=Arial,Fontsize=28,PrimaryColour=&HFFFFFF&," +
-        "OutlineColour=&H000000&,BorderStyle=3,Outline=2,Shadow=0";
-      // 注意：这里用单引号包路径，Linux 下无盘符冒号，无需转义 ‘:’
-      finalFilter = `${filter};` +
-        `[v0]subtitles='${srtPath}':force_style='${style}',format=yuv420p[v]`;
+    if (subPath) {
+      // 处理样式与字符集
+      const charenc = (subtitles.charenc || 'UTF-8').trim();
+      // 如果是 .ass 且未显式给 force_style，则尊重 ASS 文件内样式；否则使用传入或默认样式
+      const forceStyle =
+        (subIsASS && !subtitles.force_style)
+          ? null
+          : (subtitles.force_style || 'FontName=Arial,Fontsize=22,BorderStyle=1,Outline=2,Shadow=0,Alignment=2,MarginV=80');
+
+      const fontsdir = subtitles.fontsdir ? String(subtitles.fontsdir) : null;
+
+      // 组装 subtitles 滤镜参数
+      const subOpts = [`'${subPath}'`];
+      if (charenc) subOpts.push(`charenc='${charenc}'`);
+      if (fontsdir) subOpts.push(`fontsdir='${fontsdir}'`);
+      if (forceStyle) subOpts.push(`force_style='${forceStyle}'`);
+
+      const subFilter = `subtitles=${subOpts.join(':')}`;
+
+      finalFilter = `${filter};[v0]${subFilter},format=yuv420p[v]`;
       finalVideoLabel = '[v]';
     }
 
@@ -169,7 +184,7 @@ app.post('/make/segments', async (req, res) => {
       // 清理临时文件
       fs.unlink(img, () => {});
       fs.unlink(aud, () => {});
-      if (srtPath) fs.unlink(srtPath, () => {});
+      if (subPath) fs.unlink(subPath, () => {});
 
       if (code !== 0) {
         console.error('ffmpeg exit', code, '\n', stderr);
